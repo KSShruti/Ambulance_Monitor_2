@@ -1,0 +1,763 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ambulatory Patient Monitor - Hospital View (Firebase Sync)</title>
+
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@3.7.0/dist/chart.min.js"></script>
+
+    <!-- FIREBASE SDK v9 COMPATIBILITY IMPORTS -->
+    <script src="https://www.gstatic.com/firebasejs/9.6.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.6.1/firebase-database-compat.js"></script>
+
+    <style>
+        /* Custom styles for light-mode, professional monitoring look */
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f8f8f8;
+            color: #1f2937;
+            overflow: hidden;
+            padding: 0.75rem !important;
+        }
+        .metric-card {
+            background-color: #ffffff;
+            border: 1px solid #e5e7eb;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+            border-radius: 0.5rem;
+            padding: 0.75rem;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            height: 100%;
+            position: relative; /* Needed for absolute positioning of score bar */
+        }
+        .metric-label {
+            font-size: 0.8rem;
+            color: #6b7280;
+            margin-bottom: 0.1rem;
+            text-transform: uppercase;
+        }
+        .metric-value {
+            font-size: 1.8rem;
+            font-weight: bold;
+            line-height: 1;
+        }
+        .chart-container {
+            background-color: #ffffff;
+            border: 1px solid #e5e7eb;
+            border-radius: 0.5rem;
+            overflow: hidden;
+            min-height: 0;
+        }
+        canvas {
+            background-color: #ffffff;
+        }
+
+        /* VITAL VALUE COLORS */
+        .value-hr { color: #10b981; }
+        .value-spo2 { color: #3b82f6; }
+        .value-rr { color: #f59e0b; }
+        .value-temp { color: #ef4444; }
+        .value-hrv { color: #8b5cf6; }
+
+        /* CHART BORDER COLORS */
+        .chart-ecg { border-left: 5px solid #10b981; }
+        .chart-ppg { border-left: 5px solid #3b82f6; }
+        .chart-rr { border-left: 5px solid #f59e0b; }
+
+        .status-indicator {
+            width: 1rem;
+            height: 1rem;
+            border-radius: 50%;
+            background-color: #ef4444;
+            transition: background-color 0.3s ease;
+        }
+        .status-indicator.connected {
+            background-color: #10b981;
+        }
+        .status-indicator.buffering {
+            background-color: #f59e0b; /* Amber */
+        }
+
+        .vital-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            grid-template-rows: repeat(5, minmax(0, 1fr));
+            gap: 0.4rem;
+            height: 100%;
+        }
+        /* Style for data entry fields */
+        .logistics-input {
+            border: 1px solid #ccc;
+            border-radius: 0.25rem;
+            padding: 0.5rem;
+            font-size: 0.875rem;
+            color: #1f2937;
+        }
+
+        /* --- PDS SCORING BAR STYLES --- */
+        .score-bar-container {
+            width: 90%;
+            height: 10px;
+            display: flex;
+            margin-top: 8px;
+            border-radius: 5px;
+            overflow: hidden;
+            position: relative;
+        }
+        .score-bar-segment {
+            flex-grow: 1;
+            height: 100%;
+            transition: background-color 0.3s;
+        }
+        .score-bar-segment:nth-child(1) { background-color: #10b981; /* Green (Score 0) */ }
+        .score-bar-segment:nth-child(2) { background-color: #fcd34d; /* Yellow (Score 1) */ }
+        .score-bar-segment:nth-child(3) { background-color: #f97316; /* Orange (Score 2) */ }
+        .score-bar-segment:nth-child(4) { background-color: #ef4444; /* Red (Score 3) */ }
+
+        .score-pointer {
+            position: absolute;
+            bottom: -5px; /* Position below the bar */
+            width: 0;
+            height: 0;
+            border-left: 5px solid transparent;
+            border-right: 5px solid transparent;
+            border-top: 8px solid #374151; /* Dark pointer */
+            transition: left 0.5s ease-in-out;
+            transform: translateX(-50%);
+            z-index: 10;
+        }
+
+        /* --- TOTAL PDS SCORE COLORS --- */
+        .pds-stable { background-color: #d1fae5; color: #065f46; border: 1px solid #10b981; }
+        .pds-urgent { background-color: #fef3c7; color: #92400e; border: 1px solid #f59e0b; }
+        .pds-critical { background-color: #fee2e2; color: #991b1b; border: 1px solid #ef4444; }
+
+    </style>
+</head>
+<body class="flex flex-col h-screen p-4">
+
+    <header class="flex justify-between items-center mb-3 text-[#1f2937] border-b border-gray-300 pb-2">
+
+        <div class="flex items-center gap-4">
+            <h1 class="text-xl font-bold">Ambulatory Monitor </h1>
+        </div>
+
+        <div class="flex items-center gap-4">
+             <div class="text-base font-semibold text-right">
+                 <p>Patient ID: <span id="patient-id-value" class="font-bold text-gray-900">--</span></p>
+                <div class="flex gap-2 justify-end text-sm mt-1">
+                    <input type="text" id="patient-name-input" class="logistics-input w-24" placeholder="Name">
+                    <input type="number" id="patient-age-input" class="logistics-input w-12" placeholder="Age">
+                    <select id="patient-gender-input" class="logistics-input w-10">
+                        <option value="M">M</option>
+                        <option value="F">F</option>
+                        <option value="O">O</option>
+                    </select>
+                </div>
+            </div>
+            <div class="flex items-center gap-2">
+                <span class="text-sm text-gray-500" id="status-text">Data Stream:</span>
+                <div id="connection-indicator" class="status-indicator"></div>
+            </div>
+        </div>
+    </header>
+
+    <div class="logistics-panel flex flex-col gap-3 mb-4 p-3 bg-white border border-gray-300 rounded-lg shadow">
+        <h2 class="text-base font-bold text-gray-700">Patient Assignment & Logistics:</h2>
+
+        <div class="grid grid-cols-6 gap-4 items-center">
+
+            <div class="flex flex-col col-span-1">
+                <span class="text-xs text-gray-500 mb-1">Assigned Doctor:</span>
+                <input type="text" id="doc-input" class="logistics-input bg-gray-100" placeholder="Dr. Smith, Cardiology" disabled>
+            </div>
+
+            <div class="flex flex-col col-span-1">
+                <span class="text-xs text-gray-500 mb-1">Assigned Nurse:</span>
+                <input type="text" id="nurse-input" class="logistics-input bg-gray-100" placeholder="Nurse Ann, Trauma" disabled>
+            </div>
+
+            <div class="flex flex-col col-span-1">
+                <span class="text-xs text-gray-500 mb-1">Assigned Paramedic:</span>
+                <input type="text" id="paramedic-input" class="logistics-input bg-gray-100" placeholder="EMT John" disabled>
+            </div>
+
+            <div class="flex flex-col col-span-1">
+                <span class="text-xs text-gray-500 mb-1">Target Bed/Room:</span>
+                <input type="text" id="bed-input" class="logistics-input bg-gray-100 font-bold text-red-600" placeholder="Awaiting Assignment..." disabled>
+            </div>
+
+            <button id="save-logistics-btn" class="self-end bg-blue-600 text-white px-3 py-1.5 rounded text-sm hover:bg-blue-700 transition-colors h-10 col-span-1">
+                Register/Update Patient
+            </button>
+
+            <button id="clear-monitor-btn" class="self-end bg-red-600 text-white px-3 py-1.5 rounded text-sm hover:bg-red-700 transition-colors h-10 col-span-1">
+                Clear Monitor Stream
+            </button>
+
+        </div>
+        <p class="text-xs text-gray-500 text-right" id="logistics-updated-time">Last updated: --</p>
+    </div>
+
+
+    <div class="flex flex-1 gap-3 overflow-hidden">
+
+        <div class="flex flex-col w-3/4 gap-3">
+
+            <div class="chart-container flex-1 chart-ecg flex flex-col justify-center">
+                <h3 class="text-sm font-semibold text-gray-600 px-4 pt-1">ECG (Electrocardiogram)</h3>
+                <canvas id="ecgChart"></canvas>
+            </div>
+
+            <div class="chart-container flex-1 chart-ppg flex flex-col justify-center">
+                <h3 class="text-sm font-semibold text-gray-600 px-4 pt-1">PPG (Photoplethysmogram)</h3>
+                <canvas id="ppgChart"></canvas>
+            </div>
+
+            <div class="chart-container flex-1 chart-rr flex flex-col justify-center">
+                <h3 class="text-sm font-semibold text-gray-600 px-4 pt-1">RR (Respiration Rate - EDR)</h3>
+                <canvas id="rrChart"></canvas>
+            </div>
+
+            <!-- NEW PDS SUMMARY CARD (BELOW CHARTS) -->
+            <div id="pds-summary-card" class="p-4 rounded-lg text-center transition-all duration-300 pds-stable">
+                <p class="text-sm font-semibold mb-1">Patient Deterioration Score</p>
+                <p id="total-pds-score" class="text-3xl font-extrabold">--</p>
+                <p id="pds-triage-text-footer" class="text-sm mt-1">-- Triage</p>
+            </div>
+            <!-- END NEW PDS SUMMARY CARD -->
+
+        </div>
+
+        <div class="flex flex-col w-1/4 gap-3">
+
+            <div class="vital-grid flex-1">
+                <div class="metric-card" id="hr-card">
+                    <p class="metric-label">HR</p>
+                    <p class="metric-value value-hr" id="hr-value">--</p>
+                    <p class="text-gray-500 text-xs mt-1">BPM</p>
+                    <div class="score-bar-container"><div class="score-bar-segment"></div><div class="score-bar-segment"></div><div class="score-bar-segment"></div><div class="score-bar-segment"></div><div class="score-pointer" id="score-pointer-hr"></div></div>
+                </div>
+                <div class="metric-card" id="spo2-card">
+                    <p class="metric-label">SpO₂</p>
+                    <p class="metric-value value-spo2" id="spo2-value">--</p>
+                    <p class="text-gray-500 text-xs mt-1">%</p>
+                    <div class="score-bar-container"><div class="score-bar-segment"></div><div class="score-bar-segment"></div><div class="score-bar-segment"></div><div class="score-bar-segment"></div><div class="score-pointer" id="score-pointer-spo2"></div></div>
+                </div>
+                <div class="metric-card" id="rr-card">
+                    <p class="metric-label">RR</p>
+                    <p class="metric-value value-rr" id="rr-value">--</p>
+                    <p class="text-gray-500 text-xs mt-1">BPM</p>
+                    <div class="score-bar-container"><div class="score-bar-segment"></div><div class="score-bar-segment"></div><div class="score-bar-segment"></div><div class="score-bar-segment"></div><div class="score-pointer" id="score-pointer-rr"></div></div>
+                </div>
+                 <div class="metric-card">
+                    <p class="metric-label">Temp</p>
+                    <p class="metric-value value-temp" id="temp-value">--</p>
+                    <p class="text-gray-500 text-xs mt-1">°C</p>
+                    <!-- Temp does not contribute to PDS, so no score bar needed here -->
+                </div>
+                <div class="metric-card" id="hrv-card">
+                    <p class="metric-label">HRV (RMSSD)</p>
+                    <p class="metric-value value-hrv" id="hrv-value">--</p>
+                    <p class="text-gray-500 text-xs mt-1">ms</p>
+                    <div class="score-bar-container"><div class="score-bar-segment"></div><div class="score-bar-segment"></div><div class="score-bar-segment"></div><div class="score-bar-segment"></div><div class="score-pointer" id="score-pointer-hrv"></div></div>
+                </div>
+            </div>
+
+            <div class="flex flex-col gap-3 pt-2">
+                <!-- CRITICAL ALERT PANEL -->
+                <div id="critical-alert-panel" class="p-3 rounded-lg text-white font-bold text-center transition-all duration-300 bg-red-600 shadow-xl" style="display: none;">
+                    CRITICAL ALERT!
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <footer class="py-2 mt-2"></footer>
+
+
+    <script>
+        // *** FIREBASE CONFIGURATION ***
+        // NOTE: The Firebase configuration below must match the Python script's configuration.
+        const firebaseConfig = {
+          apiKey: "AIzaSyAAUeebZlb07z-90q2noOiSQAZa99Q1RX0",
+          authDomain: "ambulance-monitoring-5ad1a.firebaseapp.com",
+          databaseURL: "https://ambulance-monitoring-5ad1a-default-rtdb.asia-southeast1.firebasedatabase.app",
+          projectId: "ambulance-monitoring-5ad1a",
+          storageBucket: "ambulance-monitoring-5ad1a.appspot.com",
+          messagingSenderId: "83156963253",
+          appId: "1:83156963253:web:c73fb3f0e80afc9f8b93fc",
+          measurementId: "G-QVBTJZ5XY6"
+        };
+
+        // Initialize Firebase
+        const app = firebase.initializeApp(firebaseConfig);
+        const db = app.database();
+
+        // References to the key database nodes
+        const dbRef = db.ref('/');
+        const logisticsRef = db.ref('logistics'); // Assignment data from Reception
+        const vitalsRef = db.ref('vitals');       // Live data from Python/ESP32
+        const patientsRef = db.ref('patients');   // Patient directory for Registration
+
+        const refreshRate = 500; // Vitals polling interval (kept for Chart.js updates)
+        let currentPatientId = null;
+
+        // Element references
+        const elements = {
+            hr: document.getElementById('hr-value'),
+            hrv: document.getElementById('hrv-value'),
+            rr: document.getElementById('rr-value'),
+            spo2: document.getElementById('spo2-value'),
+            temp: document.getElementById('temp-value'),
+            connectionIndicator: document.getElementById('connection-indicator'),
+            statusText: document.getElementById('status-text'),
+
+            // PDS Elements (Right Column)
+            criticalAlertPanel: document.getElementById('critical-alert-panel'),
+            pointerHr: document.getElementById('score-pointer-hr'),
+            pointerHrv: document.getElementById('score-pointer-hrv'),
+            pointerRr: document.getElementById('score-pointer-rr'),
+            pointerSpo2: document.getElementById('score-pointer-spo2'),
+
+            // PDS Summary Elements (Left Column Footer)
+            pdsSummaryCard: document.getElementById('pds-summary-card'),
+            totalPdsScore: document.getElementById('total-pds-score'),
+            pdsTriageTextFooter: document.getElementById('pds-triage-text-footer'),
+
+            // Patient Info Elements (Inputs)
+            patientIdValue: document.getElementById('patient-id-value'),
+            nameInput: document.getElementById('patient-name-input'),
+            ageInput: document.getElementById('patient-age-input'),
+            genderInput: document.getElementById('patient-gender-input'),
+
+            // Logistics Elements (Read-Only)
+            docInput: document.getElementById('doc-input'),
+            nurseInput: document.getElementById('nurse-input'),
+            bedInput: document.getElementById('bed-input'),
+            paramedicInput: document.getElementById('paramedic-input'),
+            saveBtn: document.getElementById('save-logistics-btn'),
+            clearBtn: document.getElementById('clear-monitor-btn'),
+            updateTime: document.getElementById('logistics-updated-time')
+        };
+
+        // Chart.js instances
+        let ecgChart, ppgChart, rrChart;
+
+        const chartColors = {
+            ecg: '#10b981',
+            ppg: '#3b82f6',
+            rr: '#f59e0b'
+        };
+
+        // --- UTILITY FUNCTIONS ---
+
+        async function generatePatientId() {
+            let id;
+            const snapshot = await patientsRef.once('value');
+            const existingPatients = snapshot.val() || {};
+            const existingIds = Object.keys(existingPatients);
+
+            do {
+                id = 'P' + Math.floor(100000 + Math.random() * 900000).toString();
+            } while (existingIds.includes(id));
+            return id;
+        }
+
+        const formatValue = (value, decimals, defaultText = '--') => {
+            if (value == null || isNaN(value) || value === '--') { return defaultText; }
+            return parseFloat(value).toFixed(decimals);
+        };
+        const formatTime = (isoString) => {
+            if (!isoString) return '--';
+            try { return new Date(isoString).toLocaleTimeString(); } catch { return '--'; }
+        }
+
+        function updateStatusDisplay(status) {
+            elements.connectionIndicator.classList.remove('connected', 'buffering');
+            elements.statusText.textContent = 'Data Stream: ';
+            if (status === 'LIVE' || status === 'MONITORING') {
+                elements.connectionIndicator.classList.add('connected');
+                elements.statusText.textContent = 'Monitoring';
+            } else if (status === 'BUFFERING') {
+                elements.connectionIndicator.classList.add('buffering');
+                elements.statusText.textContent = 'Buffering...';
+            } else {
+                elements.connectionIndicator.classList.remove('connected');
+                elements.statusText.textContent = 'Offline';
+            }
+        }
+
+        /**
+         * Updates the position of the score bar pointer based on the individual score (0-3).
+         * @param {HTMLElement} pointerElement The pointer DOM element.
+         * @param {number} score The PDS score for the specific vital (0, 1, 2, or 3).
+         */
+        function updateIndividualScorePointer(pointerElement, score) {
+            let position;
+            // Map score (0, 1, 2, 3) to a position percentage on the bar (0% to 100%)
+            switch (score) {
+                case 0: position = '12.5%'; break;  // Center of first segment (25% wide)
+                case 1: position = '37.5%'; break;  // Center of second segment
+                case 2: position = '62.5%'; break;  // Center of third segment
+                case 3: position = '87.5%'; break;  // Center of fourth segment
+                default: position = '50%'; // Default to middle if score is invalid
+            }
+            pointerElement.style.left = position;
+        }
+
+        /**
+         * Updates the appearance of the Total PDS Summary Card.
+         * @param {number} pdsScore The total PDS score (0-12).
+         * @param {string} triageText The calculated triage protocol text.
+         */
+        function updateTotalPdsDisplay(pdsScore, triageText) {
+            const card = elements.pdsSummaryCard;
+            card.classList.remove('pds-stable', 'pds-urgent', 'pds-critical');
+
+            if (pdsScore === '--' || pdsScore == null || isNaN(pdsScore)) {
+                card.classList.add('pds-stable'); // Default appearance
+            } else if (pdsScore >= 8) {
+                card.classList.add('pds-critical');
+            } else if (pdsScore >= 4) {
+                card.classList.add('pds-urgent');
+            } else {
+                card.classList.add('pds-stable');
+            }
+
+            elements.totalPdsScore.textContent = pdsScore === '--' ? '--' : pdsScore;
+            elements.pdsTriageTextFooter.textContent = triageText;
+        }
+
+
+        function initializeCharts(waveformTimes) {
+            // Note: Chart.js is loaded via CDN, so we can initialize charts here.
+            const chartOptions = (color) => ({
+                responsive: true, maintainAspectRatio: false, animation: { duration: 0 }, parsing: false,
+                scales: { x: { type: 'linear', min: 0, max: waveformTimes.length > 0 ? waveformTimes[waveformTimes.length - 1] : 5, grid: { display: false }, ticks: { display: false }, border: { display: false } },
+                          y: { grid: { color: '#e5e7eb', lineWidth: 0.5 }, ticks: { display: false }, border: { display: false } } },
+                plugins: { legend: { display: false }, tooltip: { enabled: false }, title: { display: false } }, elements: { point: { radius: 0 } }
+            });
+
+            const createChart = (ctxId, color) => {
+                const ctx = document.getElementById(ctxId).getContext('2d');
+                return new Chart(ctx, {
+                    type: 'line', data: { labels: waveformTimes, datasets: [{ data: [], borderColor: color, borderWidth: 2, tension: 0.1, fill: false }] },
+                    options: chartOptions(color)
+                });
+            };
+
+            ecgChart = createChart('ecgChart', chartColors.ecg);
+            ppgChart = createChart('ppgChart', chartColors.ppg);
+            rrChart = createChart('rrChart', chartColors.rr);
+        }
+
+
+        // --- REAL-TIME LOGISTICS LISTENER ---
+        function startLogisticsListener() {
+            logisticsRef.on('value', async (snapshot) => {
+                const logistics = snapshot.val();
+                const isAssigned = logistics && logistics.bed && logistics.bed !== '--';
+                const registeredPatientId = elements.patientIdValue.textContent;
+
+
+                if (logistics && logistics.patient_id && logistics.patient_id !== '--') {
+                    // --- 1. HANDLING LOGISTICS DATA (Registration or Assignment) ---
+
+                    if (logistics.patient_id === registeredPatientId) {
+                        currentPatientId = logistics.patient_id;
+
+                        // Read-only assignment fields
+                        elements.docInput.value = logistics.doctor || 'N/A';
+                        elements.nurseInput.value = logistics.nurse || 'N/A';
+                        elements.paramedicInput.value = logistics.paramedic || 'N/A';
+
+                        if (isAssigned) {
+                            elements.bedInput.value = logistics.bed;
+                            elements.bedInput.placeholder = 'Assigned';
+                            elements.bedInput.classList.remove('text-red-600');
+                            elements.bedInput.classList.add('text-green-600');
+                        } else {
+                            elements.bedInput.value = '';
+                            elements.bedInput.placeholder = 'Awaiting Assignment...';
+                            elements.bedInput.classList.remove('text-green-600');
+                            elements.bedInput.classList.add('text-red-600');
+                        }
+
+                        // Demographic fields (Read from logistics)
+                        elements.patientIdValue.textContent = logistics.patient_id;
+                        elements.nameInput.value = logistics.patient_name || '';
+                        elements.ageInput.value = logistics.patient_age || '';
+                        elements.genderInput.value = logistics.patient_gender || 'M';
+
+                        const time = formatTime(logistics.updated_at);
+                        elements.updateTime.textContent = `Last synced: ${time}`;
+
+                        // Lock demographics and disable save if assignment is confirmed by reception
+                        elements.nameInput.disabled = isAssigned;
+                        elements.ageInput.disabled = isAssigned;
+                        elements.genderInput.disabled = isAssigned;
+
+                        elements.saveBtn.textContent = isAssigned ? 'Assignment Confirmed' : 'Update Demographics';
+                        elements.saveBtn.disabled = isAssigned;
+
+                    } else {
+                        console.warn(`Logistics ID (${logistics.patient_id}) does not match Monitor ID (${registeredPatientId}). Ignoring assignment data for now.`);
+                    }
+
+
+                } else {
+                    // --- 3. HANDLE MONITOR RESET / NO ACTIVE PATIENT IN LOGISTICS ---
+                    if (!currentPatientId || currentPatientId === '--') {
+                        currentPatientId = await generatePatientId();
+                        elements.patientIdValue.textContent = currentPatientId;
+                    }
+
+                    // Unlock demographics and enable save button
+                    elements.nameInput.disabled = false;
+                    elements.ageInput.disabled = false;
+                    elements.genderInput.disabled = false;
+                    elements.saveBtn.textContent = 'Register Patient';
+                    elements.saveBtn.disabled = false;
+
+                    // Clear assignment fields
+                    elements.docInput.value = elements.nurseInput.value = elements.paramedicInput.value = 'N/A';
+                    elements.bedInput.value = '';
+                    elements.bedInput.placeholder = 'Awaiting Assignment...';
+                    elements.bedInput.classList.remove('text-green-600');
+                    elements.bedInput.classList.add('text-red-600');
+
+
+                    elements.updateTime.textContent = `Last synced: --`;
+                }
+            }, (error) => {
+                console.error("Firebase Logistics Read Error:", error);
+            });
+        }
+
+
+        // --- CORE LOGISTICS/REGISTRATION FUNCTIONS (Writes to Firebase /patients and /logistics) ---
+        async function saveLogistics() {
+            elements.saveBtn.disabled = true;
+            elements.saveBtn.textContent = 'Processing...';
+
+            const pId = elements.patientIdValue.textContent;
+            const pName = elements.nameInput.value.trim();
+            const pAge = elements.ageInput.value.trim();
+            const pGender = elements.genderInput.value;
+
+            if (!pName || !pAge) {
+                console.error("Please enter patient name and age.");
+                // Use custom modal or message instead of alert
+                elements.saveBtn.textContent = 'Register/Update Patient';
+                elements.saveBtn.disabled = false;
+                return;
+            }
+
+            try {
+                const patientSnapshot = await patientsRef.child(pId).once('value');
+                const currentPatient = patientSnapshot.val() || {};
+
+                const logisticsSnapshot = await logisticsRef.once('value');
+                const currentLogistics = logisticsSnapshot.val() || {};
+
+
+                // 1. Update/Register patient in the Reception's patient list (/patients/{pId})
+                const patientDataToSave = {
+                    ...currentPatient,
+                    id: pId,
+                    name: pName,
+                    age: parseInt(pAge),
+                    gender: pGender,
+                    condition: currentPatient.condition || 'Ambulatory Monitoring',
+                    is_active: true,
+                    registration_time: currentPatient.registration_time || new Date().toISOString(),
+                    current_room: currentPatient.current_room || '',
+                    assigned_doctor_id: currentPatient.assigned_doctor_id || '',
+                    assigned_nurse_id: currentPatient.assigned_nurse_id || ''
+                };
+
+                let doctor = currentLogistics.doctor || '--';
+                let nurse = currentLogistics.nurse || '--';
+                let paramedic = currentLogistics.paramedic || '--';
+                let bed = currentLogistics.bed || '--';
+
+                if (currentLogistics.patient_id !== pId || bed !== '--') {
+                    doctor = nurse = paramedic = bed = '--';
+                }
+
+                const logisticsDataToSave = {
+                    patient_id: pId,
+                    patient_name: pName,
+                    patient_age: pAge,
+                    patient_gender: pGender,
+                    doctor: doctor,
+                    nurse: nurse,
+                    paramedic: paramedic,
+                    bed: bed,
+                    updated_at: new Date().toISOString()
+                };
+
+                const updates = {};
+                updates[`patients/${pId}`] = patientDataToSave;
+                updates[`logistics`] = logisticsDataToSave;
+
+                await dbRef.update(updates);
+
+                console.log(`Patient ${pName} (${pId}) registered/updated in system for reception.`);
+                // Use custom message instead of alert
+            } catch (error) {
+                console.error("Error saving logistics:", error);
+                // Use custom message instead of alert
+            } finally {
+                // The logistics listener handles re-enabling the button and updating fields
+            }
+        }
+
+        // --- NEW: Function to clear the monitor stream ---
+        async function clearMonitorStream() {
+            if (!currentPatientId || currentPatientId === '--') {
+                // Use custom message instead of alert
+                return;
+            }
+
+            // In a real application, you'd use a custom modal here
+             if (!window.confirm("Are you sure you want to clear the monitor stream? This action prepares the monitor for a NEW patient and resets the logistics link.")) return;
+
+             // Reset the shared logistics node to empty state
+            const initialLogistics = {
+                patient_id: '--',
+                patient_name: '--',
+                patient_age: '--',
+                patient_gender: '--',
+                doctor: '--',
+                nurse: '--',
+                paramedic: '--',
+                bed: '--',
+                updated_at: new Date().toISOString()
+            };
+
+            const vitalsReset = { status: 'OFFLINE' };
+
+            const updates = {};
+            updates['logistics'] = initialLogistics;
+            updates['vitals'] = vitalsReset;
+
+            try {
+                await dbRef.update(updates);
+            } catch (error) {
+                 console.error("Error clearing monitor stream:", error);
+            }
+
+            currentPatientId = null;
+            elements.nameInput.value = '';
+            elements.ageInput.value = '';
+            elements.genderInput.value = 'M';
+
+            console.log("Monitor stream cleared and logistics reset.");
+            logisticsRef.once('value');
+            // Use custom message instead of alert
+        }
+
+
+        // --- VITAL SIGNS FETCH/WRITE FUNCTION (Uses Firebase RTDB) ---
+        async function fetchAndUpdateData() {
+            const status = currentPatientId ? 'LIVE' : 'OFFLINE';
+
+            try {
+                // 1. WRITE only the status to Firebase if a patient is active.
+                if (currentPatientId) {
+                    await vitalsRef.update({ status: status });
+                } else {
+                    await vitalsRef.update({ status: 'OFFLINE' });
+                }
+
+                // 2. READ the actual vitals data written by the Python script
+                const snapshot = await vitalsRef.once('value');
+                const liveVitalsData = snapshot.val() || {};
+
+                // Default placeholders if data is missing
+                const defaultVitals = {
+                    hr: '--', hrv: '--', rr: '--', spo2: '--', temp: '--',
+                    pds: '--', pds_triage: '-- Triage', critical_alert: false,
+                    score_hr: 0, score_hrv: 0, score_rr: 0, score_spo2: 0, // Default scores to 0
+                    status: 'OFFLINE'
+                };
+                const data = { ...defaultVitals, ...liveVitalsData };
+
+                // 3. VITAL SIGNS ASSIGNMENT
+                elements.hr.textContent = formatValue(data.hr, 1);
+                elements.hrv.textContent = formatValue(data.hrv, 2);
+                elements.rr.textContent = formatValue(data.rr, 2);
+                elements.spo2.textContent = formatValue(data.spo2, 1);
+                elements.temp.textContent = formatValue(data.temp, 2);
+
+                // 4. PDS VISUAL UPDATE
+                updateTotalPdsDisplay(data.pds, data.pds_triage);
+                updateIndividualScorePointer(elements.pointerHr, data.score_hr);
+                updateIndividualScorePointer(elements.pointerHrv, data.score_hrv);
+                updateIndividualScorePointer(elements.pointerRr, data.score_rr);
+                updateIndividualScorePointer(elements.pointerSpo2, data.score_spo2);
+
+                if (data.critical_alert) {
+                    elements.criticalAlertPanel.style.display = 'block';
+                } else {
+                    elements.criticalAlertPanel.style.display = 'none';
+                }
+
+                // 5. CHART UPDATE LOGIC
+                // We check if charts are initialized and if we have waveform data to update them.
+                if (!ecgChart && data.waveform_times && data.waveform_times.length > 0) {
+                    initializeCharts(data.waveform_times);
+                }
+
+                if (ecgChart && data.ecg_waveform) {
+                     const ecgData = data.ecg_waveform.map((val, i) => ({ x: data.waveform_times[i], y: val }));
+                     ecgChart.data.datasets[0].data = ecgData;
+                     ecgChart.update('none');
+                }
+                if (ppgChart && data.ppg_waveform) {
+                     const ppgData = data.ppg_waveform.map((val, i) => ({ x: data.waveform_times[i], y: val }));
+                     ppgChart.data.datasets[0].data = ppgData;
+                     ppgChart.update('none');
+                }
+                if (rrChart && data.rr_waveform) {
+                     const rrData = data.rr_waveform.map((val, i) => ({ x: data.waveform_times[i], y: val }));
+                     rrChart.data.datasets[0].data = rrData;
+                     rrChart.update('none');
+                }
+
+                // 6. Update Connection Status
+                updateStatusDisplay(data.status);
+
+            } catch (error) {
+                console.error('Data stream interrupted/Firebase Error:', error);
+                updateStatusDisplay('OFFLINE');
+
+            } finally {
+                setTimeout(fetchAndUpdateData, refreshRate);
+            }
+        }
+
+        // --- AUTORUN LOGIC ---
+        document.addEventListener('DOMContentLoaded', () => {
+            elements.saveBtn.addEventListener('click', saveLogistics);
+            elements.clearBtn.addEventListener('click', clearMonitorStream);
+
+            if (!currentPatientId) {
+                 generatePatientId().then(id => {
+                    elements.patientIdValue.textContent = id;
+                    currentPatientId = id;
+                 });
+            }
+
+            startLogisticsListener();
+            setTimeout(fetchAndUpdateData, 500);
+        });
+    </script>
+</body>
+</html>

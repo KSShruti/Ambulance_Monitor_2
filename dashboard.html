@@ -1,0 +1,324 @@
+import numpy as np
+import time
+import threading
+from scipy.signal import butter, filtfilt, find_peaks, detrend
+import math
+import collections
+
+# --- FIREBASE IMPORTS ---
+import firebase_admin
+from firebase_admin import credentials, db
+
+# ----------------------------
+
+# --- 1. CONFIGURATION (SIMULATOR ONLY) ---
+FS = 100.0
+WINDOW_SECONDS = 5  # Waveform display window (5 seconds at 100Hz = 500 samples)
+CALCULATION_INTERVAL = 1.0  # Pushes data every 1.0 second.
+CYCLE_PERIOD_SECONDS = 60  # Full cycle from stable to critical and back
+
+# --- FIREBASE SETUP ---
+# NOTE: Replace the path and URL below with your actual Firebase credentials!
+FIREBASE_CRED_PATH = "C:/Users/USER/Downloads/ambulance-monitoring-5ad1a-firebase-adminsdk-fbsvc-dd6120eecf.json"
+FIREBASE_DATABASE_URL = "https://ambulance-monitoring-5ad1a-default-rtdb.asia-southeast1.firebasedatabase.app"
+FIREBASE_NODE = 'vitals'
+# ----------------------------------------------------
+
+
+# --- INITIALIZE FIREBASE ADMIN SDK ---
+try:
+    cred = credentials.Certificate(FIREBASE_CRED_PATH)
+    firebase_admin.initialize_app(cred, {'databaseURL': FIREBASE_DATABASE_URL})
+    ref = db.reference(FIREBASE_NODE)
+    print("--- Firebase Connection Successful ---")
+except Exception as e:
+    ref = None
+    print(f"\nFATAL ERROR: Could not initialize Firebase. Check FIREBASE_CRED_PATH and DATABASE_URL. Details: {e}")
+
+# --- 4. Global Data State ---
+last_calculation_time = 0.0
+simulation_step = 0
+latest_metrics = {
+    "timestamp": int(time.time() * 1000),
+    "hr": 0.0, "hrv": 0.0, "rr": 0.0, "spo2": 0.0, "temp": 0.0,
+    # PDS Metrics
+    "pds": 0, "pds_triage": "Less Urgent Triage", "critical_alert": False,
+    "score_hr": 0, "score_hrv": 0, "score_rr": 0, "score_spo2": 0,
+    # Waveforms (500 samples for 5 seconds)
+    "ecg_waveform": [0.0] * int(WINDOW_SECONDS * FS),
+    "ppg_waveform": [0.0] * int(WINDOW_SECONDS * FS),
+    "rr_waveform": [0.0] * int(WINDOW_SECONDS * FS),
+    "waveform_times": list(np.arange(0, WINDOW_SECONDS, 1 / FS)),
+    "status": "INITIALIZING"
+}
+
+# --- Waveform History Buffers (Deques for seamless scrolling) ---
+WINDOW_SAMPLES = int(WINDOW_SECONDS * FS)
+ecg_history = collections.deque(np.zeros(WINDOW_SAMPLES), maxlen=WINDOW_SAMPLES)
+ppg_history = collections.deque(np.zeros(WINDOW_SAMPLES), maxlen=WINDOW_SAMPLES)
+rr_history = collections.deque(np.zeros(WINDOW_SAMPLES), maxlen=WINDOW_SAMPLES)
+
+
+# --- 5. SYNTHETIC WAVEFORM GENERATION FUNCTIONS ---
+
+def generate_ecg(hr_bpm, fs, samples_per_update):
+    """Generates synthetic ECG signal (QRS complex) based on HR."""
+    t = np.linspace(0, samples_per_update / fs, samples_per_update, endpoint=False)
+    T_heart = 60 / hr_bpm
+    ecg_signal = np.zeros(samples_per_update)
+    peak_indices = np.arange(0, samples_per_update, int(fs * T_heart))
+
+    for idx in peak_indices:
+        # Create a sharp R-peak and a smaller T-wave (simple Gaussian approximation)
+        for i in range(-5, 10):
+            if 0 <= idx + i < samples_per_update:
+                ecg_signal[idx + i] += 1.5 * np.exp(-0.5 * (i / 1.5) ** 2)
+                if i > 2:
+                    ecg_signal[idx + i] -= 0.2 * np.exp(-0.5 * ((i - 5) / 3) ** 2)
+
+    # Scale and center the signal (simulating raw ADC values)
+    return 1000 + 500 * ecg_signal
+
+
+def generate_ppg(hr_bpm, fs, samples_per_update):
+    """Generates synthetic PPG signal (smooth pulse wave)."""
+    t = np.linspace(0, samples_per_update / fs, samples_per_update, endpoint=False)
+    f_pulse = hr_bpm / 60.0
+
+    # Base PPG is a smooth, somewhat asymmetric pulse shape
+    ppg_signal = 0.5 * np.sin(2 * np.pi * f_pulse * t) + 0.2 * np.sin(4 * np.pi * f_pulse * t + np.pi / 4)
+
+    # Simulating DC offset (raw sensor values)
+    ppg_signal = 10000 + 500 * ppg_signal
+    return ppg_signal
+
+
+def generate_rr_waveform(rr_bpm, fs, samples_per_update):
+    """Generates synthetic Respiratory Effort Derived (EDR) signal."""
+    t = np.linspace(0, samples_per_update / fs, samples_per_update, endpoint=False)
+    f_resp = rr_bpm / 60.0
+
+    # Simple low frequency sine wave simulating slow chest movement
+    rr_signal = 0.5 * np.sin(2 * np.pi * f_resp * t)
+
+    # Return centered signal
+    return rr_signal
+
+
+# --- PDS SCORING LOGIC (COPIED) ---
+def get_score(value, parameter):
+    """Assigns a PDS score (0-3) based on the parameter and its value."""
+    if parameter == 'HR':
+        if 60 <= value <= 100:
+            return 0
+        elif 50 <= value <= 59 or 101 <= value <= 110:
+            return 1
+        elif 40 <= value <= 49 or 111 <= value <= 120:
+            return 2
+        elif value < 40 or value > 120:
+            return 3
+    elif parameter == 'HRV':
+        if value >= 30:
+            return 0
+        elif 25 <= value <= 29:
+            return 1
+        elif 20 <= value <= 24:
+            return 2
+        elif value < 20:
+            return 3
+    elif parameter == 'SpO2':
+        if 95 <= value <= 100:
+            return 0
+        elif 93 <= value <= 94:
+            return 1
+        elif 90 <= value <= 92:
+            return 2
+        elif value < 90:
+            return 3
+    elif parameter == 'RR':
+        if 12 <= value <= 18:
+            return 0
+        elif 8 <= value <= 11 or 19 <= value <= 24:
+            return 1
+        elif 5 <= value <= 7 or 25 <= value <= 30:
+            return 2
+        elif value < 5 or value > 30:
+            return 3
+
+    return 0
+
+
+def calculate_pds(hr, hrv, spo2, rr):
+    """Calculates the total PDS and determines the Triage Protocol and Alert status, returns individual scores."""
+
+    score_hr = get_score(hr, 'HR')
+    score_hrv = get_score(hrv, 'HRV')
+    score_spo2 = get_score(spo2, 'SpO2')
+    score_rr = get_score(rr, 'RR')
+
+    total_pds = score_hr + score_hrv + score_spo2 + score_rr
+
+    if 0 <= total_pds <= 3:
+        triage = "Less Urgent Triage"
+    elif 4 <= total_pds <= 7:
+        triage = "Urgent Triage"
+    elif 8 <= total_pds <= 12:
+        triage = "Trauma Bay"
+    else:
+        triage = "Check Vitals"
+
+    is_critical_alert = (total_pds >= 8 or score_hr == 3 or score_hrv == 3 or score_spo2 == 3 or score_rr == 3)
+
+    return total_pds, triage, is_critical_alert, score_hr, score_hrv, score_spo2, score_rr
+
+
+# --- 7. FIREBASE PUSH FUNCTION (COPIED) ---
+def push_to_firebase(metrics):
+    """Pushes the latest metrics object to the Firebase Realtime Database."""
+    global ref
+    if ref is None:
+        return
+
+    try:
+        ref.set(metrics)
+    except Exception as e:
+        print(f"ERROR: Failed to push data to Firebase. Details: {e}")
+
+
+# --- 8. FIREBASE STATUS CHECK (COPIED) ---
+def get_vitals_status_from_firebase():
+    """Reads the status flag set by the HTML dashboard to control data stream."""
+    global ref
+    if ref is None:
+        return 'OFFLINE'
+
+    try:
+        status_ref = db.reference(FIREBASE_NODE + '/status')
+        status_snapshot = status_ref.get()
+        return status_snapshot if status_snapshot else 'OFFLINE'
+    except Exception as e:
+        print(f"Warning: Failed to read Firebase status: {e}")
+        return 'OFFLINE'
+
+
+# --- 9. Data Pipeline Thread (SIMULATOR MODE) ---
+def serial_data_pipeline():
+    """Simulates data processing and waveform generation."""
+    global last_calculation_time, latest_metrics, simulation_step, ecg_history, ppg_history, rr_history
+
+    print("--- PDS Simulator Initialized (Dynamic Waveforms Active) ---")
+
+    samples_per_update = int(FS * CALCULATION_INTERVAL)
+
+    while True:
+        try:
+            current_time = time.time()
+            dashboard_status = get_vitals_status_from_firebase()
+
+            if dashboard_status != 'LIVE':
+                if latest_metrics["status"] != 'OFFLINE':
+                    latest_metrics["status"] = 'OFFLINE'
+                    push_to_firebase({"status": "OFFLINE", "timestamp": int(current_time * 1000)})
+                time.sleep(1)
+                continue
+
+            # 2. Check calculation interval (runs every 1.0s)
+            if current_time - last_calculation_time >= CALCULATION_INTERVAL:
+                last_calculation_time = current_time
+
+                # --- VITAL SIGN SIMULATION (Sinusoidal cycling) ---
+                t_cycle = (simulation_step % CYCLE_PERIOD_SECONDS) * (2 * math.pi / CYCLE_PERIOD_SECONDS)
+
+                # HR cycles between 35 and 125
+                avg_hr = 80 + 45 * math.sin(t_cycle)
+
+                # HRV cycles between 10 and 50
+                rmssd = 30 - 20 * math.sin(t_cycle)
+
+                # SpO2 cycles between 90 and 100
+                spo2_val = 95 - 5 * math.sin(t_cycle)
+
+                # RR cycles between 5 and 35
+                avg_rr = 20 + 15 * math.sin(t_cycle)
+                avg_temp = 36.5
+
+                simulation_step += 1
+                # --- END VITAL SIGN SIMULATION ---
+
+                # --- WAVEFORM GENERATION AND HISTORY UPDATE ---
+                new_ecg = generate_ecg(avg_hr, FS, samples_per_update)
+                new_ppg = generate_ppg(avg_hr, FS, samples_per_update)
+                new_rr = generate_rr_waveform(avg_rr, FS, samples_per_update)
+
+                # Append the new samples to the history deques
+                for sample in new_ecg:
+                    ecg_history.append(sample)
+                for sample in new_ppg:
+                    ppg_history.append(sample)
+                for sample in new_rr:
+                    rr_history.append(sample)
+
+                # Convert history back to lists for Firebase push
+                ecg_waveform = list(ecg_history)
+                ppg_waveform = list(ppg_history)
+                rr_waveform = list(rr_history)
+
+                # --- PDS Calculation ---
+                pds_score, pds_triage, is_critical, score_hr, score_hrv, score_spo2, score_rr = calculate_pds(avg_hr,
+                                                                                                              rmssd,
+                                                                                                              spo2_val,
+                                                                                                              avg_rr)
+                # -----------------------
+
+                # 5. Update Local Metrics
+                latest_metrics["timestamp"] = int(current_time * 1000)
+                latest_metrics["hr"] = round(avg_hr, 1)
+                latest_metrics["hrv"] = round(rmssd, 2)
+                latest_metrics["rr"] = round(avg_rr, 2)
+                latest_metrics["spo2"] = round(spo2_val, 1)
+                latest_metrics["temp"] = round(avg_temp, 2)
+
+                # --- PDS Update ---
+                latest_metrics["pds"] = pds_score
+                latest_metrics["pds_triage"] = pds_triage
+                latest_metrics["critical_alert"] = is_critical
+                latest_metrics["score_hr"] = score_hr
+                latest_metrics["score_hrv"] = score_hrv
+                latest_metrics["score_rr"] = score_rr
+                latest_metrics["score_spo2"] = score_spo2
+                # ------------------
+
+                latest_metrics["ecg_waveform"] = ecg_waveform
+                latest_metrics["ppg_waveform"] = ppg_waveform
+                latest_metrics["rr_waveform"] = rr_waveform
+                latest_metrics["status"] = "LIVE"
+
+                # 6. PUSH TO FIREBASE
+                push_to_firebase(latest_metrics)
+
+                print(
+                    f"| HR: {latest_metrics['hr']:.1f} | SpO2: {latest_metrics['spo2']:.1f}% | PDS: {latest_metrics['pds']} ({latest_metrics['pds_triage']}) | -> Data Sent")
+
+            time.sleep(0.001)
+
+        except Exception as e:
+            print(f"An unexpected error occurred in simulation pipeline: {e}")
+            latest_metrics["status"] = "PROCESSING_ERROR"
+            push_to_firebase(latest_metrics)
+            time.sleep(1)
+
+
+# --- 10. Main Execution Block ---
+
+if __name__ == '__main__':
+    print("--- Ambulatory Data Sender Initializing (SIMULATION MODE) ---")
+    data_thread = threading.Thread(target=serial_data_pipeline, daemon=True)
+    data_thread.start()
+    while True:
+        try:
+            time.sleep(1)
+        except KeyboardInterrupt:
+            print("\nSimulator stopped by user.")
+            break
+
+
